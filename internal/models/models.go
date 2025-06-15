@@ -6,7 +6,6 @@ import (
 	"time"
 )
 
-// BankTransaction represents a bank statement transaction
 type BankTransaction struct {
 	ID              int64     `db:"id" json:"id"`
 	TransactionID   string    `db:"transaction_id" json:"transaction_id"`
@@ -19,7 +18,6 @@ type BankTransaction struct {
 	UpdatedAt       time.Time `db:"updated_at" json:"-"`
 }
 
-// AccountingEntry represents an internal accounting system entry
 type AccountingEntry struct {
 	ID            int64     `db:"id" json:"id"`
 	EntryID       string    `db:"entry_id" json:"entry_id"`
@@ -32,7 +30,6 @@ type AccountingEntry struct {
 	UpdatedAt     time.Time `db:"updated_at" json:"-"`
 }
 
-// Reconciliation represents a reconciliation record
 type Reconciliation struct {
 	ID               int64     `db:"id" json:"id"`
 	BatchID          string    `db:"reconciliation_batch_id" json:"reconciliation_batch_id"`
@@ -43,7 +40,6 @@ type Reconciliation struct {
 	UpdatedAt        time.Time `db:"updated_at" json:"-"`
 }
 
-// ReconciliationMapping represents the relationship between transactions and entries
 type ReconciliationMapping struct {
 	ID                int64         `db:"id" json:"id"`
 	ReconciliationID  int64         `db:"reconciliation_id" json:"reconciliation_id"`
@@ -53,7 +49,6 @@ type ReconciliationMapping struct {
 	CreatedAt         time.Time     `db:"created_at" json:"-"`
 }
 
-// ReconciliationAudit represents an audit trail entry
 type ReconciliationAudit struct {
 	ID               int64           `db:"id" json:"id"`
 	ReconciliationID int64           `db:"reconciliation_id" json:"reconciliation_id"`
@@ -63,7 +58,6 @@ type ReconciliationAudit struct {
 	CreatedAt        time.Time       `db:"created_at" json:"-"`
 }
 
-// ReconciliationStatus constants
 const (
 	StatusMatched             = "matched"
 	StatusUnmatchedBank       = "unmatched_bank"
@@ -71,14 +65,12 @@ const (
 	StatusDisputed            = "disputed"
 )
 
-// MappingType constants
 const (
 	MappingOneToOne  = "one_to_one"
 	MappingOneToMany = "one_to_many"
 	MappingManyToOne = "many_to_one"
 )
 
-// AuditAction constants
 const (
 	AuditActionCreated   = "created"
 	AuditActionMatched   = "matched"

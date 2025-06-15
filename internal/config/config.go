@@ -14,7 +14,6 @@ type Config struct {
 }
 
 func LoadConfig() (*Config, error) {
-	// Load .env file if it exists
 	_ = godotenv.Load()
 
 	cfg := &Config{
@@ -23,12 +22,10 @@ func LoadConfig() (*Config, error) {
 		ServerAddress: os.Getenv("SERVER_ADDRESS"),
 	}
 
-	// Set defaults if not provided
 	if cfg.ServerAddress == "" {
 		cfg.ServerAddress = ":8080"
 	}
 
-	// Validate required fields
 	if cfg.MySQLDSN == "" {
 		return nil, errors.New("MYSQL_DSN is required")
 	}
