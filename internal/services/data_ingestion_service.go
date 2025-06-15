@@ -2,7 +2,6 @@ package services
 
 import (
 	"database/sql"
-	"encoding/json"
 	"fmt"
 
 	"reconciliation-service/internal/models"
@@ -91,25 +90,6 @@ func (s *DataIngestionService) IngestBankTransactions(transactions []BankTransac
 		result.RecordsCount++
 	}
 
-	auditDetails, _ := json.Marshal(map[string]interface{}{
-		"total_records": len(transactions),
-		"successful":    result.RecordsCount,
-		"failed":        len(result.Errors),
-	})
-
-	if result.RecordsCount > 0 {
-		audit := &models.ReconciliationAudit{
-			Action:  models.AuditActionCreated,
-			Details: auditDetails,
-			UserID:  "system", // Could be replaced with actual user ID if authentication is implemented
-		}
-		err = s.reconciliationRepo.CreateAuditEntry(tx, audit)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create audit entry: %v", err)
-		}
-	}
-
-	// Update result status
 	result.Success = len(result.Errors) == 0
 	result.Details["total_records"] = len(transactions)
 	result.Details["successful"] = result.RecordsCount
@@ -138,13 +118,11 @@ func (s *DataIngestionService) IngestAccountingEntries(entries []AccountingEntry
 	defer tx.Rollback()
 
 	for _, input := range entries {
-		// Validate input
 		if err := validateAccountingEntry(input); err != nil {
 			result.Errors = append(result.Errors, fmt.Sprintf("Invalid entry %s: %v", input.EntryID, err))
 			continue
 		}
 
-		// Convert to model
 		entry := &models.AccountingEntry{
 			EntryID:       input.EntryID,
 			AccountCode:   input.AccountCode,
@@ -154,7 +132,6 @@ func (s *DataIngestionService) IngestAccountingEntries(entries []AccountingEntry
 			InvoiceNumber: input.InvoiceNumber,
 		}
 
-		// Insert entry
 		err := s.accountingRepo.InsertAccountingEntry(tx, entry)
 		if err != nil {
 			result.Errors = append(result.Errors, fmt.Sprintf("Failed to insert entry %s: %v", input.EntryID, err))
@@ -164,26 +141,6 @@ func (s *DataIngestionService) IngestAccountingEntries(entries []AccountingEntry
 		result.RecordsCount++
 	}
 
-	// Create audit entry
-	auditDetails, _ := json.Marshal(map[string]interface{}{
-		"total_records": len(entries),
-		"successful":    result.RecordsCount,
-		"failed":        len(result.Errors),
-	})
-
-	if result.RecordsCount > 0 {
-		audit := &models.ReconciliationAudit{
-			Action:  models.AuditActionCreated,
-			Details: auditDetails,
-			UserID:  "system", // Could be replaced with actual user ID if authentication is implemented
-		}
-		err = s.reconciliationRepo.CreateAuditEntry(tx, audit)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create audit entry: %v", err)
-		}
-	}
-
-	// Update result status
 	result.Success = len(result.Errors) == 0
 	result.Details["total_records"] = len(entries)
 	result.Details["successful"] = result.RecordsCount

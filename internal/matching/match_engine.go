@@ -9,23 +9,40 @@ import (
 )
 
 const (
+	// Match confidence thresholds
 	PerfectMatchConfidence = 1.00
 	HighMatchConfidence    = 0.95
 	MediumMatchConfidence  = 0.80
 	LowMatchConfidence     = 0.60
 
+	// Amount difference tolerance (in percentage)
 	AmountTolerancePercent = 0.01 // 1%
 
+	// Date difference tolerance (in days)
 	DateToleranceDays = 3
 )
 
 type MatchResult struct {
-	Type              string
-	Confidence        float64
+	Type              string  // one_to_one, one_to_many
+	Confidence        float64 // 0.00 to 1.00
 	BankTransaction   *models.BankTransaction
 	AccountingEntries []*models.AccountingEntry
 	AmountDifference  float64
 	MatchCriteria     []string
+}
+
+type MatchesResult struct {
+	Type             string  // one_to_one, one_to_many
+	Confidence       float64 // 0.00 to 1.00
+	BankTransaction  string
+	AccountingEntry  string
+	AmountDifference float64
+	MatchCriteria    []string
+}
+
+type UnmatchResult struct {
+	BankTransactions  string
+	AccountingEntries []string
 }
 
 type MatchEngine struct {
@@ -42,7 +59,6 @@ func (m *MatchEngine) SetData(bankTransactions []*models.BankTransaction, accoun
 	m.accountingEntries = accountingEntries
 }
 
-// ProcessMatches processes all transactions and returns match results
 func (m *MatchEngine) ProcessMatches() ([]*MatchResult, error) {
 	var results []*MatchResult
 
@@ -119,13 +135,13 @@ func (m *MatchEngine) checkOneToOneMatch(bt *models.BankTransaction, ae *models.
 	amountTolerance := bt.Amount * AmountTolerancePercent
 
 	if amountDiff == 0 {
-		matchCriteria = append(matchCriteria, "amount_exact")
+		matchCriteria = append(matchCriteria, "amount")
 		confidence += 0.4
 	} else if amountDiff <= amountTolerance {
-		matchCriteria = append(matchCriteria, "amount_close")
+		matchCriteria = append(matchCriteria, "amount")
 		confidence += 0.3
 	} else {
-		return nil
+		return nil // Amount difference too large
 	}
 
 	btDate, _ := time.Parse("2006-01-02", bt.TransactionDate)
@@ -133,21 +149,19 @@ func (m *MatchEngine) checkOneToOneMatch(bt *models.BankTransaction, ae *models.
 	dateDiff := math.Abs(float64(btDate.Sub(aeDate).Hours() / 24))
 
 	if dateDiff == 0 {
-		matchCriteria = append(matchCriteria, "date_exact")
+		matchCriteria = append(matchCriteria, "date")
 		confidence += 0.3
 	} else if dateDiff <= float64(DateToleranceDays) {
-		matchCriteria = append(matchCriteria, "date_close")
+		matchCriteria = append(matchCriteria, "date")
 		confidence += 0.2
 	}
 
 	if bt.ReferenceNumber != "" && ae.InvoiceNumber != "" {
 		if bt.ReferenceNumber == ae.InvoiceNumber {
-			matchCriteria = append(matchCriteria, "reference_exact")
+			matchCriteria = append(matchCriteria, "reference")
 			confidence += 0.3
-		} else if strings.Contains(bt.ReferenceNumber, ae.InvoiceNumber) ||
-			strings.Contains(ae.InvoiceNumber, bt.ReferenceNumber) {
-			matchCriteria = append(matchCriteria, "reference_partial")
-			confidence += 0.2
+		} else {
+			confidence = 0
 		}
 	}
 
@@ -169,7 +183,7 @@ func (m *MatchEngine) findOneToManyMatch(bt *models.BankTransaction, processedID
 	var bestMatch *MatchResult
 	var minDifference float64 = bt.Amount // Start with the full amount as the difference
 
-	combinations := m.findPossibleEntryCombinations(bt.Amount, processedIDs)
+	combinations := m.findPossibleEntryCombinations(bt, bt.Amount, processedIDs)
 
 	for _, entries := range combinations {
 		var totalAmount float64
@@ -183,6 +197,32 @@ func (m *MatchEngine) findOneToManyMatch(bt *models.BankTransaction, processedID
 
 			confidence := m.calculateOneToManyConfidence(bt, entries, difference)
 
+			var matchCriteria []string
+			matchCriteria = append(matchCriteria, "amount")
+
+			btDate, _ := time.Parse("2006-01-02", bt.TransactionDate)
+			var maxDateDiff float64
+			for _, ae := range entries {
+				aeDate, _ := time.Parse("2006-01-02", ae.EntryDate)
+				dateDiff := math.Abs(float64(btDate.Sub(aeDate).Hours() / 24))
+				if dateDiff > maxDateDiff {
+					maxDateDiff = dateDiff
+				}
+			}
+
+			if maxDateDiff <= float64(DateToleranceDays) {
+				matchCriteria = append(matchCriteria, "date")
+			}
+
+			if bt.ReferenceNumber != "" {
+				for _, ae := range entries {
+					if ae.InvoiceNumber != "" && strings.Contains(ae.InvoiceNumber, bt.ReferenceNumber) {
+						matchCriteria = append(matchCriteria, "reference")
+						break
+					}
+				}
+			}
+
 			if confidence >= MediumMatchConfidence {
 				bestMatch = &MatchResult{
 					Type:              models.MappingOneToMany,
@@ -190,7 +230,7 @@ func (m *MatchEngine) findOneToManyMatch(bt *models.BankTransaction, processedID
 					BankTransaction:   bt,
 					AccountingEntries: entries,
 					AmountDifference:  difference,
-					MatchCriteria:     []string{"amount_sum_match", "date_proximity"},
+					MatchCriteria:     matchCriteria,
 				}
 			}
 		}
@@ -199,14 +239,16 @@ func (m *MatchEngine) findOneToManyMatch(bt *models.BankTransaction, processedID
 	return bestMatch
 }
 
-func (m *MatchEngine) findPossibleEntryCombinations(targetAmount float64, processedIDs map[int64]bool) [][]*models.AccountingEntry {
+func (m *MatchEngine) findPossibleEntryCombinations(bt *models.BankTransaction, targetAmount float64, processedIDs map[int64]bool) [][]*models.AccountingEntry {
 	var result [][]*models.AccountingEntry
 	var candidates []*models.AccountingEntry
 
-	// Filter unprocessed entries within date range
 	for _, ae := range m.accountingEntries {
 		if !processedIDs[ae.ID] && ae.Amount <= targetAmount {
-			candidates = append(candidates, ae)
+			if bt.ReferenceNumber != "" && ae.InvoiceNumber != "" &&
+				strings.Contains(ae.InvoiceNumber, bt.ReferenceNumber) {
+				candidates = append([]*models.AccountingEntry{ae}, candidates...)
+			}
 		}
 	}
 
@@ -241,7 +283,7 @@ func (m *MatchEngine) findCombinations(candidates []*models.AccountingEntry, siz
 }
 
 func (m *MatchEngine) calculateOneToManyConfidence(bt *models.BankTransaction, entries []*models.AccountingEntry, amountDiff float64) float64 {
-	var confidence float64 = 0.7
+	var confidence float64 = 0.7 // Base confidence for matching sum
 
 	if amountDiff == 0 {
 		confidence += 0.2
@@ -261,6 +303,22 @@ func (m *MatchEngine) calculateOneToManyConfidence(bt *models.BankTransaction, e
 
 	if maxDateDiff <= float64(DateToleranceDays) {
 		confidence += 0.1
+	}
+
+	if bt.ReferenceNumber != "" {
+		matchCount := 0
+		for _, ae := range entries {
+			if ae.InvoiceNumber != "" && strings.Contains(ae.InvoiceNumber, bt.ReferenceNumber) {
+				matchCount++
+			}
+		}
+		if matchCount > 0 {
+			confidence += 0.1 * float64(matchCount) / float64(len(entries))
+		}
+	}
+
+	if confidence > HighMatchConfidence {
+		confidence = HighMatchConfidence
 	}
 
 	return confidence

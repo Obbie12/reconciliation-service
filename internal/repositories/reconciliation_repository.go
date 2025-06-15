@@ -206,7 +206,6 @@ func (r *reconciliationRepository) GetUnmatchedRecords(fromDate, toDate string) 
 		})
 	}
 
-	// Get unmatched accounting entries
 	accountingQuery := `
 		SELECT ae.id, ae.entry_id, ae.amount, ae.entry_date
 		FROM accounting_entries ae

@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"sync"
 	"time"
 
 	"reconciliation-service/internal/matching"
@@ -35,32 +36,22 @@ func NewReconciliationService(
 }
 
 type ReconciliationResult struct {
-	BatchID             string                    `json:"batch_id"`
-	Status              string                    `json:"status"`
-	Matches             []*matching.MatchResult   `json:"matches"`
-	UnmatchedBank       []*models.BankTransaction `json:"unmatched_bank,omitempty"`
-	UnmatchedAccounting []*models.AccountingEntry `json:"unmatched_accounting,omitempty"`
-	Summary             map[string]interface{}    `json:"summary"`
+	BatchID   string                    `json:"reconciliation_id"`
+	Status    string                    `json:"status"`
+	Matches   []*matching.MatchesResult `json:"matches"`
+	Unmatched []*matching.UnmatchResult `json:"unmatched,omitempty"`
+	Summary   map[string]interface{}    `json:"summary"`
+}
+
+func (s *ReconciliationService) GetBankTransactions(fromDate, toDate string) ([]*models.BankTransaction, error) {
+	return s.bankRepo.GetUnreconciledTransactions(fromDate, toDate)
+}
+
+func (s *ReconciliationService) GetAccountingEntries(fromDate, toDate string) ([]*models.AccountingEntry, error) {
+	return s.accountingRepo.GetUnreconciledEntries(fromDate, toDate)
 }
 
 func (s *ReconciliationService) StartReconciliation(fromDate, toDate string) (*ReconciliationResult, error) {
-	tx, err := s.db.Begin()
-	if err != nil {
-		return nil, fmt.Errorf("failed to begin transaction: %v", err)
-	}
-	defer tx.Rollback()
-
-	batchID := fmt.Sprintf("REC-%s", time.Now().Format("20060102-150405"))
-	reconciliation := &models.Reconciliation{
-		BatchID: batchID,
-		Status:  models.StatusMatched,
-	}
-
-	err = s.reconciliationRepo.CreateReconciliation(tx, reconciliation)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create reconciliation batch: %v", err)
-	}
-
 	bankTransactions, err := s.bankRepo.GetUnreconciledTransactions(fromDate, toDate)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get unreconciled bank transactions: %v", err)
@@ -71,66 +62,150 @@ func (s *ReconciliationService) StartReconciliation(fromDate, toDate string) (*R
 		return nil, fmt.Errorf("failed to get unreconciled accounting entries: %v", err)
 	}
 
+	return s.ProcessReconciliationWithData(fromDate, toDate, bankTransactions, accountingEntries)
+}
+
+func (s *ReconciliationService) ProcessReconciliationWithData(fromDate, toDate string, bankTransactions []*models.BankTransaction, accountingEntries []*models.AccountingEntry) (*ReconciliationResult, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("failed to begin transaction: %v", err)
+	}
+	defer tx.Rollback()
+
+	batchID := fmt.Sprintf("REC-%s", time.Now().Format("20060102-150405"))
+
 	s.matchEngine.SetData(bankTransactions, accountingEntries)
 
-	matches, err := s.matchEngine.ProcessMatches()
-	if err != nil {
-		return nil, fmt.Errorf("failed to process matches: %v", err)
+	matchChan := make(chan []*matching.MatchResult, 1)
+	matchErrChan := make(chan error, 1)
+
+	go func() {
+		matches, err := s.matchEngine.ProcessMatches()
+		if err != nil {
+			matchErrChan <- fmt.Errorf("failed to process matches: %v", err)
+			return
+		}
+		matchChan <- matches
+	}()
+
+	var matches []*matching.MatchResult
+	select {
+	case err := <-matchErrChan:
+		return nil, err
+	case matches = <-matchChan:
 	}
 
-	var processedBankIDs = make(map[int64]bool)
-	var processedAccountingIDs = make(map[int64]bool)
+	type processResult struct {
+		bankIDs       map[int64]bool
+		accountingIDs map[int64]bool
+		err           error
+	}
+	processChan := make(chan processResult, len(matches))
 
+	var wg sync.WaitGroup
 	for _, match := range matches {
-		mapping := &models.ReconciliationMapping{
-			ReconciliationID: reconciliation.ID,
-			BankTransactionID: sql.NullInt64{
-				Int64: match.BankTransaction.ID,
-				Valid: true,
-			},
-			MappingType: match.Type,
-		}
+		wg.Add(1)
+		go func(m *matching.MatchResult) {
+			defer wg.Done()
 
-		if match.Type == models.MappingOneToOne {
-			mapping.AccountingEntryID = sql.NullInt64{
-				Int64: match.AccountingEntries[0].ID,
-				Valid: true,
+			result := processResult{
+				bankIDs:       make(map[int64]bool),
+				accountingIDs: make(map[int64]bool),
 			}
-			err = s.reconciliationRepo.CreateMapping(tx, mapping)
+
+			reconciliation := &models.Reconciliation{
+				BatchID:          batchID,
+				Status:           "matched",
+				MatchConfidence:  m.Confidence,
+				AmountDifference: m.AmountDifference,
+			}
+
+			err := s.reconciliationRepo.CreateReconciliation(tx, reconciliation)
 			if err != nil {
-				return nil, fmt.Errorf("failed to create mapping: %v", err)
+				result.err = fmt.Errorf("failed to create reconciliation batch: %v", err)
+				processChan <- result
+				return
 			}
 
-			processedBankIDs[match.BankTransaction.ID] = true
-			processedAccountingIDs[match.AccountingEntries[0].ID] = true
-		} else {
-			for _, ae := range match.AccountingEntries {
+			mapping := &models.ReconciliationMapping{
+				ReconciliationID: reconciliation.ID,
+				BankTransactionID: sql.NullInt64{
+					Int64: m.BankTransaction.ID,
+					Valid: true,
+				},
+				MappingType: m.Type,
+			}
+
+			if m.Type == models.MappingOneToOne {
 				mapping.AccountingEntryID = sql.NullInt64{
-					Int64: ae.ID,
+					Int64: m.AccountingEntries[0].ID,
 					Valid: true,
 				}
 				err = s.reconciliationRepo.CreateMapping(tx, mapping)
 				if err != nil {
-					return nil, fmt.Errorf("failed to create mapping: %v", err)
+					result.err = fmt.Errorf("failed to create mapping: %v", err)
+					processChan <- result
+					return
 				}
-				processedAccountingIDs[ae.ID] = true
-			}
-			processedBankIDs[match.BankTransaction.ID] = true
-		}
-		auditDetails, _ := json.Marshal(map[string]interface{}{
-			"match_type":     match.Type,
-			"confidence":     match.Confidence,
-			"match_criteria": match.MatchCriteria,
-		})
 
-		audit := &models.ReconciliationAudit{
-			ReconciliationID: reconciliation.ID,
-			Action:           models.AuditActionMatched,
-			Details:          auditDetails,
+				result.bankIDs[m.BankTransaction.ID] = true
+				result.accountingIDs[m.AccountingEntries[0].ID] = true
+			} else {
+				for _, ae := range m.AccountingEntries {
+					mapping.AccountingEntryID = sql.NullInt64{
+						Int64: ae.ID,
+						Valid: true,
+					}
+					err = s.reconciliationRepo.CreateMapping(tx, mapping)
+					if err != nil {
+						result.err = fmt.Errorf("failed to create mapping: %v", err)
+						processChan <- result
+						return
+					}
+					result.accountingIDs[ae.ID] = true
+				}
+				result.bankIDs[m.BankTransaction.ID] = true
+			}
+
+			auditDetails, _ := json.Marshal(map[string]interface{}{
+				"match_type":     m.Type,
+				"confidence":     m.Confidence,
+				"match_criteria": m.MatchCriteria,
+			})
+
+			audit := &models.ReconciliationAudit{
+				ReconciliationID: reconciliation.ID,
+				Action:           models.AuditActionMatched,
+				Details:          auditDetails,
+			}
+			err = s.reconciliationRepo.CreateAuditEntry(tx, audit)
+			if err != nil {
+				result.err = fmt.Errorf("failed to create audit entry: %v", err)
+				processChan <- result
+				return
+			}
+
+			processChan <- result
+		}(match)
+	}
+
+	go func() {
+		wg.Wait()
+		close(processChan)
+	}()
+
+	processedBankIDs := make(map[int64]bool)
+	processedAccountingIDs := make(map[int64]bool)
+
+	for result := range processChan {
+		if result.err != nil {
+			return nil, result.err
 		}
-		err = s.reconciliationRepo.CreateAuditEntry(tx, audit)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create audit entry: %v", err)
+		for id := range result.bankIDs {
+			processedBankIDs[id] = true
+		}
+		for id := range result.accountingIDs {
+			processedAccountingIDs[id] = true
 		}
 	}
 
@@ -149,33 +224,99 @@ func (s *ReconciliationService) StartReconciliation(fromDate, toDate string) (*R
 		}
 	}
 
-	if len(unmatchedBank) > 0 || len(unmatchedAccounting) > 0 {
-		reconciliation.Status = models.StatusUnmatchedBank
-		err = s.reconciliationRepo.UpdateReconciliationStatus(tx, reconciliation.ID, reconciliation.Status)
-		if err != nil {
-			return nil, fmt.Errorf("failed to update reconciliation status: %v", err)
-		}
+	summary := map[string]interface{}{
+		"total_processed": len(bankTransactions) + len(accountingEntries),
+		"matched":         len(matches),
+		"unmatched":       len(unmatchedBank),
+		"disputed":        0,
 	}
 
+	var m []*matching.MatchesResult
+	for _, match := range matches {
+		var entryIDs []string
+		for _, ae := range match.AccountingEntries {
+			entryIDs = append(entryIDs, ae.EntryID)
+		}
+
+		data := matching.MatchesResult{
+			Type:             match.Type,
+			Confidence:       match.Confidence,
+			BankTransaction:  match.BankTransaction.TransactionID,
+			AccountingEntry:  fmt.Sprintf("%v", entryIDs),
+			AmountDifference: match.AmountDifference,
+			MatchCriteria:    match.MatchCriteria,
+		}
+		m = append(m, &data)
+	}
+
+	var um []*matching.UnmatchResult
+	for _, unmatch := range unmatchedAccounting {
+		var entryIDs []string
+		var trID string
+		entryIDs = append(entryIDs, unmatch.EntryID)
+
+		invoiceMap := make(map[string]struct{})
+		invoiceMap[unmatch.InvoiceNumber] = struct{}{}
+
+		for _, transaction := range bankTransactions {
+			if _, exists := invoiceMap[transaction.ReferenceNumber]; exists {
+				trID = transaction.TransactionID
+			}
+		}
+
+		data := matching.UnmatchResult{
+			BankTransactions:  trID,
+			AccountingEntries: entryIDs,
+		}
+
+		reconciliation := &models.Reconciliation{
+			BatchID:          batchID,
+			Status:           "unmatched",
+			MatchConfidence:  0,
+			AmountDifference: 0,
+		}
+		err = s.reconciliationRepo.CreateReconciliation(tx, reconciliation)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create reconciliation batch: %v", err)
+		}
+
+		auditDetails, _ := json.Marshal(map[string]interface{}{
+			"bank_transactions":  trID,
+			"accounting_entries": entryIDs,
+		})
+
+		audit := &models.ReconciliationAudit{
+			ReconciliationID: reconciliation.ID,
+			Action:           models.AuditActionUnmatched,
+			Details:          auditDetails,
+		}
+		err = s.reconciliationRepo.CreateAuditEntry(tx, audit)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create audit entry: %v", err)
+		}
+
+		um = append(um, &data)
+	}
+
+	// Commit transaction
 	err = tx.Commit()
 	if err != nil {
 		return nil, fmt.Errorf("failed to commit transaction: %v", err)
 	}
 
-	summary := map[string]interface{}{
-		"total_processed":      len(bankTransactions) + len(accountingEntries),
-		"matched":              len(matches),
-		"unmatched_bank":       len(unmatchedBank),
-		"unmatched_accounting": len(unmatchedAccounting),
+	var status string
+	if len(um) > 0 {
+		status = "completed"
+	} else {
+		status = "matches"
 	}
 
 	return &ReconciliationResult{
-		BatchID:             batchID,
-		Status:              reconciliation.Status,
-		Matches:             matches,
-		UnmatchedBank:       unmatchedBank,
-		UnmatchedAccounting: unmatchedAccounting,
-		Summary:             summary,
+		BatchID:   batchID,
+		Status:    status,
+		Matches:   m,
+		Unmatched: um,
+		Summary:   summary,
 	}, nil
 }
 
